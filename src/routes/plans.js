@@ -6,11 +6,10 @@ const { requireRole, requireAuth } = require('../auth');
 const { recordAudit } = require('../audit');
 const {
   ValidationError,
-  assertDate,
-  positiveNumber,
-  nonEmptyString,
-  parsePeriods,
+  ConflictError,
+  AuthError,
 } = require('../validation');
+const { normalizeScheduleInput } = require('../plan-input');
 const {
   lockExhibit,
   getPlan,
@@ -19,6 +18,9 @@ const {
   computeOccupancy,
   buildOverflows,
   planOverlaps,
+  getPendingAdjustmentForPlan,
+  canAdjustPlan,
+  serializeAdjustment,
 } = require('../service');
 const {
   doseByYear,
@@ -26,48 +28,12 @@ const {
   buildWindows,
   subtractIntervals,
 } = require('../dosing');
-const { ConflictError, AuthError } = require('../validation');
 const { exhibitDetail } = require('./exhibits');
+const adjustmentRoutes = require('./adjustments');
 
 const router = express.Router();
 
 router.use(requireAuth);
-
-function normalizePlanInput(body) {
-  const title = nonEmptyString(body.title, '计划名称', 200);
-  const startDate = assertDate(body.startDate, '开始日期');
-  const endDate = assertDate(body.endDate, '结束日期');
-  if (endDate < startDate) throw new ValidationError('结束日期不能早于开始日期');
-  const rawPeriods = body.periods;
-  if (!Array.isArray(rawPeriods) || rawPeriods.some((p) => typeof p !== 'string')) {
-    throw new ValidationError('每日开灯时段必须是字符串数组，如 ["09:00-12:00"]');
-  }
-  const periods = parsePeriods(rawPeriods);
-  // 规范为 HH:MM-HH:MM（允许输入 HH:MM:00）
-  const periodSpecs = periods.map((p) => {
-    const endMin = (p.startMin + p.durationMin) % 1440;
-    const fmt = (min) =>
-      `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
-    return `${fmt(p.startMin)}-${fmt(endMin)}`;
-  });
-  const estimatedLux = positiveNumber(body.estimatedLux, '预计照度（lx）', { max: 1000000 });
-
-  // 展期最长约 5 年，防止误填导致的巨型计算
-  const spanMs =
-    Date.UTC(
-      Number(endDate.slice(0, 4)),
-      Number(endDate.slice(5, 7)) - 1,
-      Number(endDate.slice(8, 10))
-    ) -
-    Date.UTC(
-      Number(startDate.slice(0, 4)),
-      Number(startDate.slice(5, 7)) - 1,
-      Number(startDate.slice(8, 10))
-    );
-  if (spanMs / 86400000 + 1 > 1860) throw new ValidationError('展期跨度不能超过约 5 年');
-
-  return { title, startDate, endDate, periodSpecs, periods, estimatedLux };
-}
 
 // 计划列表（可按展品过滤）
 router.get('/', async (req, res, next) => {
@@ -84,6 +50,13 @@ router.get('/', async (req, res, next) => {
         ORDER BY p.id DESC`,
       [exhibitId]
     );
+    // 附带每条计划的待审调整申请（存在与否）及“尚未开始”标记，供页面展示原值/拟改值
+    for (const p of rows) {
+      p.not_started = planWindows(p)[0].start > Date.now();
+      const pending = await getPendingAdjustmentForPlan({ query }, p.id);
+      p.pending_adjustment_id = pending ? pending.id : null;
+      p.can_adjust = canAdjustPlan(p, Date.now());
+    }
     res.json({ plans: rows });
   } catch (err) {
     next(err);
@@ -96,7 +69,7 @@ router.post('/', requireRole('installer'), async (req, res, next) => {
     const body = req.body || {};
     const exhibitId = Number(body.exhibitId);
     if (!Number.isInteger(exhibitId)) throw new ValidationError('展品 ID 无效');
-    const input = normalizePlanInput(body);
+    const input = normalizeScheduleInput(body, { withTitle: true });
 
     const { rows } = await withExhibitTransaction(exhibitId, async (client) => {
       await lockExhibit(client, exhibitId);
@@ -152,7 +125,16 @@ router.get('/:id', async (req, res, next) => {
     const plan = await getPlan({ query }, id);
     const windows = planWindows(plan);
     const estimatedYearly = yearMapToObject(doseByYear(windows, Number(plan.estimated_lux)));
-    res.json({ plan, estimatedYearly });
+    const pendingAdjustment = await getPendingAdjustmentForPlan({ query }, id);
+    res.json({
+      plan,
+      estimatedYearly,
+      notStarted: windows[0].start > Date.now(),
+      canAdjust: canAdjustPlan(plan, Date.now()),
+      pendingAdjustment: pendingAdjustment
+        ? serializeAdjustment(pendingAdjustment, { withProposed: true })
+        : null,
+    });
   } catch (err) {
     next(err);
   }
@@ -292,5 +274,8 @@ router.post('/:id/cancel', async (req, res, next) => {
     next(err);
   }
 });
+
+// 计划调整申请：/api/plans/:id/adjustments（提交/列表）
+router.use('/:id/adjustments', adjustmentRoutes.planScopedRouter);
 
 module.exports = router;

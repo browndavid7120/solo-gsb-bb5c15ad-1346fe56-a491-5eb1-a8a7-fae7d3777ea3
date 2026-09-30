@@ -11,6 +11,7 @@ const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const exhibitRoutes = require('./routes/exhibits');
 const planRoutes = require('./routes/plans');
+const adjustmentRoutes = require('./routes/adjustments');
 const measurementRoutes = require('./routes/measurements');
 const auditRoutes = require('./routes/audit');
 
@@ -26,6 +27,7 @@ function createApp() {
   app.use('/api/users', userRoutes);
   app.use('/api/exhibits', exhibitRoutes.router);
   app.use('/api/plans', planRoutes);
+  app.use('/api/adjustments', adjustmentRoutes.rootRouter);
   app.use('/api/measurements', measurementRoutes);
   app.use('/api/audit', auditRoutes);
 

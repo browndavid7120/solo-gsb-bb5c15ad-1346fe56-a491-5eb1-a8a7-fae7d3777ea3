@@ -5,7 +5,7 @@ const { query, withTransaction, withExhibitTransaction } = require('../db');
 const { requireRole } = require('../auth');
 const { recordAudit } = require('../audit');
 const { ValidationError, nonEmptyString, positiveNumber } = require('../validation');
-const { computeOccupancy, lockExhibit } = require('../service');
+const { computeOccupancy, lockExhibit, listAdjustments, serializeAdjustment } = require('../service');
 const { tsToWallString } = require('../dosing');
 
 const router = express.Router();
@@ -47,12 +47,17 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     )
   ).rows.map(serializeMeasurement);
 
+  // 该展品的调整申请（原值/拟改值对比，供详情页展示与审核）
+  const adjustmentRows = await listAdjustments(client, { exhibitId });
+  const adjustments = adjustmentRows.map((a) => serializeAdjustment(a));
+
   return {
     exhibit,
     years: occupancy.years,
     sources: occupancy.sources,
     plans,
     measurements,
+    adjustments,
   };
 }
 

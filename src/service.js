@@ -17,7 +17,6 @@ const {
 } = require('./dosing');
 
 const ACTIVE_PLAN_STATUSES = ['approved', 'pending_review'];
-
 /** 规范化 DATE 值：真实 pg 经类型解析返回 'YYYY-MM-DD'；个别驱动（如内存测试）可能给 Date。 */
 function dateYmd(v) {
   if (typeof v === 'string') return v.slice(0, 10);
@@ -271,6 +270,229 @@ function plansToFlag(plans, occupancy, overflowYears, nowMs) {
   return flagged;
 }
 
+// ===================== 计划调整申请 =====================
+
+/** 拟改值的开灯时间窗。 */
+function adjustmentWindows(adj) {
+  return buildWindows(dateYmd(adj.new_start_date), dateYmd(adj.new_end_date),
+    parsePeriods(adj.new_light_periods));
+}
+
+/** 计划首个开灯时刻（毫秒）。 */
+function planFirstStartMs(plan) {
+  return Math.min(...planWindows(plan).map((w) => w.start));
+}
+
+/** 计划是否尚未开始（首个开灯时刻在 now 之后）。 */
+function isPlanNotStarted(plan, nowMs = Date.now()) {
+  return planFirstStartMs(plan) > nowMs;
+}
+
+/**
+ * 是否允许提交调整：仅“已批准且尚未开始”的计划。
+ * 待批准/已驳回/已取消/待复核均不允许（待复核应先由保管员复核）。
+ */
+function canAdjustPlan(plan, nowMs = Date.now()) {
+  return plan.status === 'approved' && isPlanNotStarted(plan, nowMs);
+}
+
+/** 读取某计划当前唯一的待审调整申请（无则 null）。 */
+async function getPendingAdjustmentForPlan(client, planId) {
+  const { rows } = await client.query(
+    `SELECT a.*, u.display_name AS creator_name, r.display_name AS reviewer_name
+       FROM plan_adjustments a
+       LEFT JOIN users u ON u.id = a.created_by
+       LEFT JOIN users r ON r.id = a.reviewed_by
+      WHERE a.plan_id = $1 AND a.status = 'pending'
+      ORDER BY a.id DESC LIMIT 1`,
+    [planId]
+  );
+  return rows[0] || null;
+}
+
+/** 查询调整申请列表（可按展品/计划/状态过滤），含计划与人员名称。 */
+async function listAdjustments(client, { exhibitId = null, planId = null, status = null } = {}) {
+  const conds = [];
+  const params = [];
+  if (exhibitId !== null && exhibitId !== undefined) {
+    params.push(exhibitId);
+    conds.push(`a.exhibit_id = $${params.length}`);
+  }
+  if (planId !== null && planId !== undefined) {
+    params.push(planId);
+    conds.push(`a.plan_id = $${params.length}`);
+  }
+  if (status !== null && status !== undefined) {
+    params.push(status);
+    conds.push(`a.status = $${params.length}`);
+  }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  const { rows } = await client.query(
+    `SELECT a.*, p.title AS plan_title, p.status AS plan_status,
+            p.start_date AS plan_start_date, p.end_date AS plan_end_date,
+            p.light_periods AS plan_light_periods, p.estimated_lux AS plan_estimated_lux,
+            e.name AS exhibit_name,
+            u.display_name AS creator_name, r.display_name AS reviewer_name
+       FROM plan_adjustments a
+       JOIN plans p ON p.id = a.plan_id
+       JOIN exhibits e ON e.id = a.exhibit_id
+       LEFT JOIN users u ON u.id = a.created_by
+       LEFT JOIN users r ON r.id = a.reviewed_by
+       ${where}
+      ORDER BY a.id DESC`,
+    params
+  );
+  return rows;
+}
+
+/** 调整申请序列化（含原值与拟改值对比、按年拟改剂量）。 */
+function serializeAdjustment(adj, { withProposed = true } = {}) {
+  const proposed = withProposed
+    ? {
+        startDate: dateYmd(adj.new_start_date),
+        endDate: dateYmd(adj.new_end_date),
+        periods: adj.new_light_periods,
+        estimatedLux: Number(adj.new_estimated_lux),
+        estimatedYearly: yearMapToObject(
+          doseByYear(adjustmentWindows(adj), Number(adj.new_estimated_lux))
+        ),
+      }
+    : null;
+  return {
+    id: adj.id,
+    planId: adj.plan_id,
+    exhibitId: adj.exhibit_id,
+    exhibitName: adj.exhibit_name || null,
+    planTitle: adj.plan_title || null,
+    note: adj.note,
+    status: adj.status,
+    createdBy: adj.created_by === null ? null : Number(adj.created_by),
+    creatorName: adj.creator_name || null,
+    reviewedBy: adj.reviewed_by === null ? null : Number(adj.reviewed_by),
+    reviewerName: adj.reviewer_name || null,
+    reviewedAt: adj.reviewed_at || null,
+    reviewNote: adj.review_note || null,
+    createdAt: adj.created_at,
+    // 原计划值（联表查询时才有，用于页面对比展示）
+    original:
+      adj.plan_title !== undefined
+        ? {
+            title: adj.plan_title,
+            planStatus: adj.plan_status,
+            startDate: dateYmd(adj.plan_start_date),
+            endDate: dateYmd(adj.plan_end_date),
+            periods: adj.plan_light_periods,
+            estimatedLux: Number(adj.plan_estimated_lux),
+          }
+        : null,
+    proposed,
+  };
+}
+
+/**
+ * 调整批准时的重新核对（须在“展品锁事务”内调用）。
+ * 规则：
+ *  1) 计划仍已批准且尚未开始；
+ *  2) 该计划所有未作废（draft/confirmed）实测仍完整落在新开灯窗内；
+ *  3) 新窗口不与同展品其他已批准/待复核计划的开灯窗重叠；
+ *  4) 以“新窗口未被已确认实测覆盖部分”的估算量替换原计划剩余估算量，
+ *     按自然年并入当前占用后任一年不得超过年度上限。
+ * 返回 { plan, newWindows, addedYearly }；任一不满足抛 ConflictError（details 携带冲突明细）。
+ */
+async function evaluateAdjustment(client, plan, adj) {
+  const nowMs = Date.now();
+  const newWindows = adjustmentWindows(adj);
+  const newLux = Number(adj.new_estimated_lux);
+  const problems = [];
+  const details = {};
+
+  // 1) 计划仍已批准且尚未开始
+  if (plan.status !== 'approved' || !isPlanNotStarted(plan, nowMs)) {
+    throw new ValidationError(
+      `计划当前状态（${plan.status === 'approved' ? '已批准但已开始' : plan.status}），该调整申请不能通过`
+    );
+  }
+
+  // 2) 该计划所有未作废实测必须仍落在新窗口内
+  const { rows: measRows } = await client.query(
+    `SELECT id, start_ts, end_ts, status, actual_lux
+       FROM measurements
+      WHERE plan_id = $1 AND status <> 'annulled'
+      ORDER BY id`,
+    [plan.id]
+  );
+  const outside = [];
+  for (const m of measRows) {
+    const seg = {
+      start: new Date(m.start_ts).getTime(),
+      end: new Date(m.end_ts).getTime(),
+    };
+    if (!newWindows.some((w) => containsInterval(w, seg))) {
+      outside.push({
+        id: m.id,
+        status: m.status,
+        start: tsToWallString(seg.start),
+        end: tsToWallString(seg.end),
+      });
+    }
+  }
+  if (outside.length > 0) {
+    details.outsideMeasurements = outside;
+    problems.push(
+      `以下未作废实测不在拟改后的开灯窗内：` +
+        outside.map((m) => `实测 #${m.id}（${m.start} ~ ${m.end}，${m.status === 'draft' ? '待确认' : '已确认'}）`).join('；')
+    );
+  }
+
+  // 3) 与同展品其他已批准/待复核计划的开灯窗重叠
+  const others = await getOccupyingPlans(client, plan.exhibit_id, plan.id);
+  const clash = others.find((other) => anyIntersect(newWindows, planWindows(other)));
+  if (clash) {
+    details.overlappingPlan = { id: clash.id, title: clash.title, status: clash.status };
+    problems.push(`新窗口与同一展品计划「${clash.title}」(#${clash.id}) 的开灯时间重叠`);
+  }
+
+  // 4) 按自然年替换原计划剩余估算量后的额度校验
+  //    当前占用已排除本计划（excludePlanId），其中实测已按原窗口归属计量；
+  //    本计划新窗口中被已确认实测覆盖的部分不重复计估算。
+  const occupancy = await computeOccupancy(client, plan.exhibit_id, { excludePlanId: plan.id });
+  const selfConfirmed = measRows
+    .filter((m) => m.status === 'confirmed')
+    .map((m) => ({ start: new Date(m.start_ts).getTime(), end: new Date(m.end_ts).getTime() }));
+  const remainingWindows = subtractIntervals(newWindows, selfConfirmed);
+  const addedYearly = yearMapToObject(doseByYear(remainingWindows, newLux));
+
+  // 未登记年度额度
+  const missingLimits = Object.keys(addedYearly)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .filter((y) => occupancy.limits[String(y)] === undefined);
+  if (missingLimits.length > 0) {
+    details.missingLimits = missingLimits;
+    problems.push(`${missingLimits.join('、')} 年尚未登记年度额度，无法通过调整`);
+  }
+
+  const overflows = buildOverflows(occupancy.used, occupancy.limits, addedYearly);
+  if (overflows.length > 0) {
+    details.overflows = overflows;
+    problems.push(
+      overflows
+        .map(
+          (o) =>
+            `${o.year} 年超出年度上限：上限 ${o.limit}，当前已用 ${o.usedBefore}，` +
+            `拟改新增 ${o.addedByThisPlan}，合计 ${o.projected}，超额 ${o.excess} lx·h`
+        )
+        .join('；')
+    );
+  }
+
+  if (problems.length > 0) {
+    throw new ConflictError(`调整申请核对未通过：${problems.join('；')}`, details);
+  }
+
+  return { newWindows, addedYearly, selfConfirmed };
+}
+
 module.exports = {
   ACTIVE_PLAN_STATUSES,
   lockExhibit,
@@ -285,4 +507,12 @@ module.exports = {
   validateMeasurementWindow,
   plansToFlag,
   yearOfTs,
+  adjustmentWindows,
+  planFirstStartMs,
+  isPlanNotStarted,
+  canAdjustPlan,
+  getPendingAdjustmentForPlan,
+  listAdjustments,
+  serializeAdjustment,
+  evaluateAdjustment,
 };

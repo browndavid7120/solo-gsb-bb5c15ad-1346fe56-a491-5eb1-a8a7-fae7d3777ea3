@@ -55,6 +55,33 @@ CREATE TABLE IF NOT EXISTS plans (
 );
 CREATE INDEX IF NOT EXISTS idx_plans_exhibit_status ON plans (exhibit_id, status);
 
+-- 计划调整申请：布展员对“已批准且尚未开始”的计划提交新展期/开灯时段/预计照度；
+-- -- 同一计划同时只允许一份待审（pending）申请，撤回/驳回/批准后可重新提交。
+-- status: pending 待审 / approved 已通过 / rejected 已驳回 / withdrawn 已撤回
+CREATE TABLE IF NOT EXISTS plan_adjustments (
+    id              BIGSERIAL PRIMARY KEY,
+    plan_id         BIGINT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    new_start_date  DATE NOT NULL,
+    new_end_date    DATE NOT NULL CHECK (new_end_date >= new_start_date),
+    -- 拟改的每日开灯时段，形如 ["09:00-12:00","13:00-17:00"]
+    new_light_periods JSONB NOT NULL,
+    new_estimated_lux NUMERIC(10,2) NOT NULL CHECK (new_estimated_lux > 0),
+    note            TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','approved','rejected','withdrawn')),
+    created_by      BIGINT REFERENCES users(id),
+    reviewed_by     BIGINT REFERENCES users(id),
+    reviewed_at     TIMESTAMPTZ,
+    review_note     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 同一计划同时只允许一份待审申请（部分唯一索引）
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_adjustment_pending_per_plan
+    ON plan_adjustments (plan_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_adjustments_exhibit ON plan_adjustments (exhibit_id, status);
+CREATE INDEX IF NOT EXISTS idx_adjustments_plan ON plan_adjustments (plan_id, id);
+
 -- 实测记录：先录入（draft），保管员确认（confirmed）后以实测替代估算；
 -- annulled 表示登记作废（原始记录保留）。
 CREATE TABLE IF NOT EXISTS measurements (

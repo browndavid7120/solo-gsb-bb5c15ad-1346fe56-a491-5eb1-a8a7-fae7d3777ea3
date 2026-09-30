@@ -79,6 +79,9 @@
             <tbody id="detail-plan-tbody"></tbody>
           </table>
 
+          <h4>计划调整申请</h4>
+          <div id="detail-adjustments"></div>
+
           <h4>实测记录</h4>
           <table class="data">
             <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态</th><th>操作</th></tr></thead>
@@ -108,6 +111,28 @@
           </div>
           <button class="primary" type="submit">提交计划（系统按自然年拆分预计剂量）</button>
         </form>
+
+        <form id="adjustment-form" class="card installer-only hidden">
+          <h4>提交计划调整申请（布展员）<span id="adjustment-form-plan" class="muted small"></span></h4>
+          <p class="muted small">仅「已批准且尚未开始」的计划可提交；同一计划同时只允许一份待审申请，撤回后可重提。待审期间原计划继续占用额度。</p>
+          <input type="hidden" name="planId" />
+          <div class="form-row">
+            <label>新开始日期<input name="startDate" type="date" required /></label>
+            <label>新结束日期<input name="endDate" type="date" required /></label>
+            <label>新预计照度 lx<input name="estimatedLux" type="number" step="0.01" min="0.01" required /></label>
+          </div>
+          <div class="form-row">
+            <label class="grow">新每日开灯时段（每行一个，HH:MM-HH:MM，可跨午夜）
+              <textarea name="periods" rows="2" placeholder="09:00-12:00&#10;13:00-17:00" required></textarea>
+            </label>
+          </div>
+          <label>说明（可选）<input name="note" maxlength="1000" /></label>
+          <div class="form-row">
+            <button class="primary" type="submit">提交调整申请</button>
+            <button type="button" id="adjustment-form-cancel" class="danger">取消填写</button>
+          </div>
+        </form>
+
         <div id="plan-list"></div>
       </section>
 

@@ -108,6 +108,33 @@
           </div>
           <button class="primary" type="submit">提交计划（系统按自然年拆分预计剂量）</button>
         </form>
+
+        <div id="adjustment-form-box" class="card installer-only hidden">
+          <div class="panel-head">
+            <h4>提交计划调整申请（已批准且尚未开始的计划）</h4>
+            <button id="adjustment-cancel" type="button" class="link">收起</button>
+          </div>
+          <form id="adjustment-form">
+            <div class="form-row">
+              <label class="grow">目标计划<input name="planLabel" readonly /></label>
+            </div>
+            <div class="form-row">
+              <label>新开始日期<input name="startDate" type="date" required /></label>
+              <label>新结束日期<input name="endDate" type="date" required /></label>
+              <label>新预计照度 lx<input name="estimatedLux" type="number" step="0.01" min="0.01" required /></label>
+            </div>
+            <div class="form-row">
+              <label class="grow">新每日开灯时段（每行一个，HH:MM-HH:MM，可跨午夜）
+                <textarea name="periods" rows="2" required></textarea>
+              </label>
+            </div>
+            <label>调整原因（可选）<input name="reason" maxlength="1000" /></label>
+            <button class="primary" type="submit">提交调整申请</button>
+            <p class="muted small">同一计划同时只允许一份待审申请，撤回后可重新提交。待审期间原计划继续占用额度；
+              保管员批准时会重新核对计划状态、未作废实测是否都在新窗口内、与其他计划是否重叠以及各年度额度。</p>
+          </form>
+        </div>
+
         <div id="plan-list"></div>
       </section>
 

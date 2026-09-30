@@ -5,7 +5,7 @@ const { query, withTransaction, withExhibitTransaction } = require('../db');
 const { requireRole } = require('../auth');
 const { recordAudit } = require('../audit');
 const { ValidationError, nonEmptyString, positiveNumber } = require('../validation');
-const { computeOccupancy, lockExhibit } = require('../service');
+const { computeOccupancy, lockExhibit, decoratePlans } = require('../service');
 const { tsToWallString } = require('../dosing');
 
 const router = express.Router();
@@ -40,6 +40,8 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
       [exhibitId]
     )
   ).rows;
+  // 附加各计划的待审调整申请（含原值/拟改值试算），原有字段保持不变
+  await decoratePlans(client, plans, { withPreview: true });
   const measurements = (
     await client.query(
       `SELECT * FROM measurements WHERE exhibit_id = $1 ORDER BY start_ts DESC, id DESC`,

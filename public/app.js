@@ -8,6 +8,7 @@ const state = {
   plans: [],
   measurements: [],
   users: [],
+  adjustments: [],
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -43,10 +44,13 @@ function esc(s) {
     .replace(/"/g, '&quot;');
 }
 const fmtN = (n) => (n === null || n === undefined ? '—' : Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 3 }));
+// 日期列兼容 'YYYY-MM-DD' 与 ISO 字符串两种形态，只取日期部分
+const ymdText = (v) => (v === null || v === undefined ? '—' : String(v).slice(0, 10));
 const STATUS_TEXT = {
   submitted: '待批准', approved: '已批准', rejected: '已驳回',
   cancelled: '已取消', pending_review: '待复核',
   draft: '待确认', confirmed: '已确认', annulled: '已作废',
+  pending: '待审', withdrawn: '已撤回',
 };
 function badge(status) {
   return `<span class="badge ${esc(status)}">${STATUS_TEXT[status] || esc(status)}</span>`;
@@ -216,16 +220,20 @@ function renderDetail() {
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
   $$('.meas-action').forEach((btn) => btn.addEventListener('click', () => measAction(btn)));
+  $$('.adj-action').forEach((btn) => btn.addEventListener('click', () => adjustmentAction(btn)));
+  $$('.adj-open').forEach((btn) => btn.addEventListener('click', () => openAdjustmentForm(Number(btn.dataset.id))));
 }
 
 function planRow(p) {
   return `<tr>
     <td>${p.id}</td>
     <td>${esc(p.title)}</td>
-    <td>${p.start_date} ~ ${p.end_date}</td>
+    <td>${ymdText(p.start_date)} ~ ${ymdText(p.end_date)}</td>
     <td>${(p.light_periods || []).map(esc).join('<br>')}</td>
     <td class="mono">${fmtN(p.estimated_lux)}</td>
-    <td>${badge(p.status)}${p.review_reason ? `<div class="small muted">${esc(p.review_reason)}</div>` : ''}</td>
+    <td>${badge(p.status)}${p.review_reason ? `<div class="small muted">${esc(p.review_reason)}</div>` : ''}
+        ${p.status === 'approved' && p.notStarted ? '<div class="small ok">尚未开始</div>' : ''}
+        ${pendingAdjustmentBlock(p)}</td>
     <td>${planActionButtons(p)}</td>
   </tr>`;
 }
@@ -241,7 +249,76 @@ function planActionButtons(p) {
   if (['submitted', 'approved', 'pending_review'].includes(p.status)) {
     btns.push(`<button class="danger small-btn plan-action" data-action="cancel" data-id="${p.id}">取消</button>`);
   }
+  // 已批准且尚未开始的计划：布展员可提交调整申请
+  if (!isCustodian && p.status === 'approved' && p.notStarted && !p.pendingAdjustment) {
+    btns.push(`<button class="small-btn plan-action adj-open" data-id="${p.id}">申请调整</button>`);
+  }
   return btns.join(' ') || '<span class="muted">—</span>';
+}
+
+/** 原计划 vs 拟改值的对照行。 */
+function scheduleDiff(orig, next) {
+  const span = (s, e) => `${s} ~ ${e}`;
+  const periods = (arr) => (arr || []).map(esc).join('、');
+  const changed = (a, b) => (String(a) !== String(b) ? ' class="changed"' : '');
+  return `<table class="diff-table"><tbody>
+    <tr><th>展期</th>
+      <td${changed(span(orig.startDate, orig.endDate), span(next.startDate, next.endDate))}>${esc(span(orig.startDate, orig.endDate))}</td>
+      <td${changed(span(orig.startDate, orig.endDate), span(next.startDate, next.endDate))}>${esc(span(next.startDate, next.endDate))}</td></tr>
+    <tr><th>每日开灯</th>
+      <td${changed(periods(orig.periods), periods(next.periods))}>${periods(orig.periods)}</td>
+      <td${changed(periods(orig.periods), periods(next.periods))}>${periods(next.periods)}</td></tr>
+    <tr><th>预计照度</th>
+      <td${changed(orig.estimatedLux, next.estimatedLux)}>${fmtN(orig.estimatedLux)} lx</td>
+      <td${changed(orig.estimatedLux, next.estimatedLux)}>${fmtN(next.estimatedLux)} lx</td></tr>
+  </tbody></table>`;
+}
+
+/** 调整试算冲突明细（批准前核对结果）。 */
+function adjustmentConflictsHtml(pv) {
+  if (!pv) return '';
+  const c = pv.conflicts || {};
+  const items = [];
+  if (c.notApproved) items.push('计划已不是「已批准」状态');
+  if (c.notStarted) items.push('计划已经开始');
+  (c.outsideMeasurements || []).forEach((m) =>
+    items.push(`未作废实测 #${m.id}（${esc(m.start)} ~ ${esc(m.end)}，${STATUS_TEXT[m.status] || m.status}）不在新开灯窗内`));
+  (c.overlappingPlans || []).forEach((p2) =>
+    items.push(`与同展品${p2.status === 'pending_review' ? '待复核' : '已批准'}计划「${esc(p2.title)}」(#${p2.id}) 开灯时间重叠`));
+  (c.missingLimits || []).forEach((y) => items.push(`${y} 年尚未登记年度额度`));
+  (c.overflows || []).forEach((o) =>
+    items.push(`${o.year} 年超额 <b>${fmtN(o.excess)} lx·h</b>（上限 ${fmtN(o.limit)}，其他占用 ${fmtN(o.usedByOthers)}，原残余 ${fmtN(o.oldResidue)}，拟改残余 ${fmtN(o.newResidue)}，合计 ${fmtN(o.projected)}）`));
+  if (items.length === 0) {
+    return `<div class="adj-ok">核对通过：拟改残余按年 ${yearlyText(pv.newResidueYearly)}</div>`;
+  }
+  return `<div class="adj-conflict"><b>当前核对未通过：</b><ul>${items.map((x) => `<li>${x}</li>`).join('')}</ul></div>`;
+}
+
+/** 计划行下的待审调整申请区块（展品详情 + 计划列表共用）。 */
+function pendingAdjustmentBlock(p) {
+  const a = p.pendingAdjustment;
+  if (!a) return '';
+  const isCustodian = state.user.role === 'conservator';
+  const isOwner = !isCustodian; // 布展员视图只处理自己提交的（后端再次鉴权）
+  const orig = a.original || {
+    startDate: p.start_date, endDate: p.end_date,
+    periods: p.light_periods, estimatedLux: p.estimated_lux,
+  };
+  const next = { startDate: a.startDate, endDate: a.endDate, periods: a.periods, estimatedLux: a.estimatedLux };
+  const btns = [];
+  if (isCustodian) {
+    btns.push(`<button class="primary small-btn adj-action" data-action="approve" data-id="${a.id}">批准调整</button>`);
+    btns.push(`<button class="small-btn adj-action" data-action="reject" data-id="${a.id}">驳回</button>`);
+  } else if (isOwner) {
+    btns.push(`<button class="danger small-btn adj-action" data-action="withdraw" data-id="${a.id}">撤回申请</button>`);
+  }
+  return `<div class="adj-box">
+    <div class="adj-head">${badge(a.status)}调整申请 #${a.id}
+      <span class="muted small">申请人 ${esc(a.creatorName || '')}${a.reason ? '；' + esc(a.reason) : ''}</span></div>
+    ${scheduleDiff(orig, next)}
+    ${a.preview ? adjustmentConflictsHtml(a.preview) : ''}
+    <div class="adj-btns">${btns.join(' ')}</div>
+  </div>`;
 }
 function measRow(m) {
   const plan = (state.detail.plans || []).find((p) => p.id === m.planId);
@@ -372,6 +449,8 @@ async function loadPlans() {
       ${plans.map(planListRow).join('')}</tbody></table>`
     : '<p class="muted">暂无计划。</p>';
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
+  $$('.adj-action').forEach((btn) => btn.addEventListener('click', () => adjustmentAction(btn)));
+  $$('.adj-open').forEach((btn) => btn.addEventListener('click', () => openAdjustmentForm(Number(btn.dataset.id))));
 }
 function planListRow(p) {
   const yearly = (p.light_periods || []); // 仅用于显示行结构，按年剂量由详情接口展示
@@ -380,11 +459,13 @@ function planListRow(p) {
     <td>${p.id}</td>
     <td>${esc(p.exhibit_name)}</td>
     <td>${esc(p.title)}</td>
-    <td>${p.start_date}<br>~ ${p.end_date}</td>
+    <td>${ymdText(p.start_date)}<br>~ ${ymdText(p.end_date)}</td>
     <td>${(p.light_periods || []).map(esc).join('<br>')}</td>
     <td class="mono">${fmtN(p.estimated_lux)} lx</td>
     <td><button class="link small-btn plan-action" data-action="view" data-id="${p.id}">查看拆分</button></td>
-    <td>${badge(p.status)}${p.review_reason ? `<div class="small muted">${esc(p.review_reason)}</div>` : ''}</td>
+    <td>${badge(p.status)}${p.review_reason ? `<div class="small muted">${esc(p.review_reason)}</div>` : ''}
+        ${p.status === 'approved' && p.notStarted ? '<div class="small ok">尚未开始</div>' : ''}
+        ${pendingAdjustmentBlock(p)}</td>
     <td>${planActionButtons(p)}</td>
   </tr>`;
 }
@@ -440,6 +521,109 @@ document.addEventListener('click', async (e) => {
       `<div class="source-doses">${yearlyText(estimatedYearly)}</div>`);
   } catch (err) { flash('error', err.message); }
 });
+
+// ---------- 计划调整申请 ----------
+/** 打开发起调整申请的表单（预填原值）。 */
+async function openAdjustmentForm(planId) {
+  let plan;
+  try {
+    ({ plan } = await api('GET', `/api/plans/${planId}`));
+  } catch (err) {
+    flash('error', err.message);
+    return;
+  }
+  if (plan.pendingAdjustment) {
+    flash('error', `该计划已有待审调整申请 #${plan.pendingAdjustment.id}，请先撤回后再重新提交`);
+    return;
+  }
+  const box = $('#adjustment-form-box');
+  box.classList.remove('hidden');
+  const form = $('#adjustment-form');
+  form.dataset.planId = planId;
+  form.elements.planLabel.value = `#${plan.id} ${plan.title}`;
+  form.elements.startDate.value = ymdText(plan.start_date);
+  form.elements.endDate.value = ymdText(plan.end_date);
+  form.elements.periods.value = (plan.light_periods || []).join('\n');
+  form.elements.estimatedLux.value = plan.estimated_lux;
+  form.elements.reason.value = '';
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+$('#adjustment-cancel').addEventListener('click', () => {
+  $('#adjustment-form-box').classList.add('hidden');
+});
+
+$('#adjustment-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const planId = Number(form.dataset.planId);
+  const periods = String(form.elements.periods.value).split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const payload = {
+    planId,
+    startDate: form.elements.startDate.value,
+    endDate: form.elements.endDate.value,
+    periods,
+    estimatedLux: Number(form.elements.estimatedLux.value),
+    reason: form.elements.reason.value || null,
+  };
+  try {
+    const { adjustment } = await api('POST', '/api/adjustments', payload);
+    $('#adjustment-form-box').classList.add('hidden');
+    const pv = adjustment.preview;
+    if (pv && !pv.ok) {
+      flash('warn', `调整申请 #${adjustment.id} 已提交（待审），但保管员核对时将发现冲突`,
+        adjustmentConflictsHtml(pv));
+    } else {
+      flash('success', `调整申请 #${adjustment.id} 已提交，等待保管员审核。待审期间原计划继续占用额度`);
+    }
+    await refreshAfterChange();
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.existingAdjustmentId) {
+      flash('error', `${err.message}（既有待审申请 #${err.data.existingAdjustmentId}）`);
+    } else {
+      flash('error', err.message);
+    }
+  }
+});
+
+/** 保管员批准/驳回、布展员撤回调整申请。 */
+async function adjustmentAction(btn) {
+  const id = Number(btn.dataset.id);
+  const action = btn.dataset.action;
+  try {
+    if (action === 'withdraw') {
+      if (!confirm(`撤回调整申请 #${id}？撤回后可重新提交。`)) return;
+      await api('POST', `/api/adjustments/${id}/withdraw`);
+      flash('success', `调整申请 #${id} 已撤回，可重新提交`);
+    } else if (action === 'reject') {
+      const reason = prompt('驳回原因（可留空）') || '';
+      await api('POST', `/api/adjustments/${id}/reject`, { reason });
+      flash('success', `调整申请 #${id} 已驳回，计划不改变`);
+    } else if (action === 'approve') {
+      try {
+        const detail = await api('POST', `/api/adjustments/${id}/approve`);
+        if (state.tab === 'exhibits' && state.detail) {
+          state.detail = detail;
+          renderDetail();
+        }
+        flash('success', `调整申请 #${id} 已批准，计划已按拟改值更新`);
+        await refreshAfterChange();
+        return;
+      } catch (err) {
+        if (err.status === 409 && err.data && err.data.conflicts) {
+          flash('error', `调整申请 #${id} 未通过核对（申请保持待审，可撤回后修改重提）`,
+            adjustmentConflictsHtml({ conflicts: err.data.conflicts }));
+          await refreshAfterChange();
+          return;
+        }
+        throw err;
+      }
+    }
+    await refreshAfterChange();
+  } catch (err) {
+    flash('error', err.message);
+  }
+}
 
 // ---------- 实测 ----------
 async function loadMeasurementsTab() {

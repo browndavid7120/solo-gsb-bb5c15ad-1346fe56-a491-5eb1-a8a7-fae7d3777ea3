@@ -6,10 +6,7 @@ const { requireRole, requireAuth } = require('../auth');
 const { recordAudit } = require('../audit');
 const {
   ValidationError,
-  assertDate,
-  positiveNumber,
   nonEmptyString,
-  parsePeriods,
 } = require('../validation');
 const {
   lockExhibit,
@@ -19,6 +16,8 @@ const {
   computeOccupancy,
   buildOverflows,
   planOverlaps,
+  decoratePlans,
+  normalizeScheduleInput,
 } = require('../service');
 const {
   doseByYear,
@@ -34,39 +33,7 @@ const router = express.Router();
 router.use(requireAuth);
 
 function normalizePlanInput(body) {
-  const title = nonEmptyString(body.title, '计划名称', 200);
-  const startDate = assertDate(body.startDate, '开始日期');
-  const endDate = assertDate(body.endDate, '结束日期');
-  if (endDate < startDate) throw new ValidationError('结束日期不能早于开始日期');
-  const rawPeriods = body.periods;
-  if (!Array.isArray(rawPeriods) || rawPeriods.some((p) => typeof p !== 'string')) {
-    throw new ValidationError('每日开灯时段必须是字符串数组，如 ["09:00-12:00"]');
-  }
-  const periods = parsePeriods(rawPeriods);
-  // 规范为 HH:MM-HH:MM（允许输入 HH:MM:00）
-  const periodSpecs = periods.map((p) => {
-    const endMin = (p.startMin + p.durationMin) % 1440;
-    const fmt = (min) =>
-      `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
-    return `${fmt(p.startMin)}-${fmt(endMin)}`;
-  });
-  const estimatedLux = positiveNumber(body.estimatedLux, '预计照度（lx）', { max: 1000000 });
-
-  // 展期最长约 5 年，防止误填导致的巨型计算
-  const spanMs =
-    Date.UTC(
-      Number(endDate.slice(0, 4)),
-      Number(endDate.slice(5, 7)) - 1,
-      Number(endDate.slice(8, 10))
-    ) -
-    Date.UTC(
-      Number(startDate.slice(0, 4)),
-      Number(startDate.slice(5, 7)) - 1,
-      Number(startDate.slice(8, 10))
-    );
-  if (spanMs / 86400000 + 1 > 1860) throw new ValidationError('展期跨度不能超过约 5 年');
-
-  return { title, startDate, endDate, periodSpecs, periods, estimatedLux };
+  return normalizeScheduleInput(body, { withTitle: true });
 }
 
 // 计划列表（可按展品过滤）
@@ -84,6 +51,8 @@ router.get('/', async (req, res, next) => {
         ORDER BY p.id DESC`,
       [exhibitId]
     );
+    // 附加各计划的待审调整申请概要（不改原有字段，保持响应兼容）
+    await decoratePlans({ query }, rows);
     res.json({ plans: rows });
   } catch (err) {
     next(err);
@@ -152,6 +121,8 @@ router.get('/:id', async (req, res, next) => {
     const plan = await getPlan({ query }, id);
     const windows = planWindows(plan);
     const estimatedYearly = yearMapToObject(doseByYear(windows, Number(plan.estimated_lux)));
+    // 待审调整申请：附带原值与拟改值试算（冲突计划/实测/超额年份与数值）
+    await decoratePlans({ query }, [plan], { withPreview: true });
     res.json({ plan, estimatedYearly });
   } catch (err) {
     next(err);

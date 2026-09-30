@@ -3,8 +3,8 @@
 面向纸本、拓本等光敏展品的**年度照度时数（剂量，单位 lx·h）额度管理** Web 应用。
 Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
 
-- **保管员（conservator）**：登记展品与每年照度时数上限、批准/驳回/复核布展计划、录入并确认实测。
-- **布展员（installer）**：创建展出计划（展期、每日开灯时段、预计照度），查看额度占用。
+- **保管员（conservator）**：登记展品与每年照度时数上限、批准/驳回/复核布展计划、审核计划调整申请、录入并确认实测。
+- **布展员（installer）**：创建展出计划（展期、每日开灯时段、预计照度）、对已批准且未开始的计划提交/撤回调整申请、查看额度占用。
 
 ## 核心业务规则
 
@@ -25,6 +25,14 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
 8. **校验报错**：非法日期/时间、零时长或互相重叠的开灯时段、非正照度/上限等一律返回明确中文错误。
 9. 页面按展品展示**每个自然年的上限、已占用、剩余额度**，以及逐条占用来源
    （已确认实测、各计划估算残余，含按年剂量）。
+10. **计划调整申请**：布展员可对「已批准且尚未开始」的计划提交调整申请（新展期、新每日开灯时段、新预计照度）。
+    - 同一计划同时只允许**一份待审申请**；撤回或被驳回/拒绝后可重新提交。
+    - **待审期间原计划继续占用额度**，计划本身不变；展品详情同时展示原值与拟改值及试算结果。
+    - 保管员**批准时在展品锁事务内重新核对**：计划仍已批准且未开始；该计划所有**未作废实测（含待确认）都落在新开灯窗内**；
+      新窗口不与同展品其他**已批准/待复核**计划重叠；并按自然年以「新窗口未被已确认实测覆盖部分」的估算量**替换原剩余估算量**，
+      任一年超年度上限即拒绝。核对通过才**原子更新计划并写审计**；驳回不改变计划。
+    - 核对失败（409）会在错误信息与结构化 `details` 中指出**冲突计划、窗外实测、超额年份与各项数值**，
+      申请**保持待审**，布展员可撤回后修改重提（也可在提额后由保管员直接批准原申请）。
 
 ## 一键启动（Docker Compose）
 
@@ -99,9 +107,119 @@ npm run test:utils
 3. 保管员在展品详情中查看按年预计剂量，执行批准/驳回；超限时会列出年份与超额量。
 4. 展后保管员在「实测记录」录入已批准计划内的实测时段与照度 → 确认；
    若迟到实测造成年度超限，相应未开始计划转待复核，保管员在详情页复核。
-5. 「操作流水」保留全部审批、确认、状态变更等记录。
+5. 计划尚未开始时，布展员可在「布展计划」对该计划点「申请调整」，改填展期/开灯时段/照度后提交；
+   保管员在计划行内查看原值与拟改值对照及核对结果，选择「批准调整」或「驳回」；布展员可撤回自己的待审申请后重提。
+6. 「操作流水」保留全部审批、调整、确认、状态变更等记录。
 
-## 目录结构
+## HTTP API（含计划调整申请）
+
+所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
+统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
+
+### 认证
+
+```bash
+# 登录（保存 Cookie）
+curl -c cookies.txt -X POST http://localhost:3000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"installer","password":"setup123"}'
+
+curl -b cookies.txt http://localhost:3000/api/auth/me
+curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
+```
+
+### 既有接口（响应保持兼容，计划对象额外附加调整字段）
+
+| 方法 & 路径 | 角色 | 说明 |
+| --- | --- | --- |
+| `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
+| `POST /api/exhibits` | 保管员 | 登记展品 |
+| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测 |
+| `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限 |
+| `GET  /api/plans?exhibitId=` | 登录 | 计划列表（附加 `notStarted`、`pendingAdjustment` 概要） |
+| `POST /api/plans` | 布展员 | 创建计划 |
+| `GET  /api/plans/:id` | 登录 | 计划详情（待审申请带 `preview` 原值/拟改值试算） |
+| `POST /api/plans/:id/approve` | 保管员 | 批准 / 复核通过 |
+| `POST /api/plans/:id/reject` | 保管员 | 驳回落计划 |
+| `POST /api/plans/:id/cancel` | 登录 | 取消（布展员仅自己未批准的；保管员均可） |
+| `GET/POST /api/measurements`、`POST /api/measurements/:id/confirm`、`DELETE /api/measurements/:id` | 保管员 | 实测录入/确认/删草稿 |
+| `GET /api/audit` | 保管员 | 操作流水 |
+
+### 计划调整申请 `/api/adjustments`
+
+| 方法 & 路径 | 角色 | 说明 |
+| --- | --- | --- |
+| `POST /api/adjustments` | 布展员 | 对已批准且未开始的计划提交调整申请（每计划至多一份待审） |
+| `POST /api/adjustments/preview` | 布展员 | 仅试算拟改值，不写库 |
+| `GET  /api/adjustments?planId=&exhibitId=&status=&preview=1` | 登录 | 申请列表/历史，带原值 |
+| `GET  /api/adjustments/:id` | 登录 | 申请详情（待审带试算） |
+| `POST /api/adjustments/:id/approve` | 保管员 | 批准：锁事务内重新核对，通过则原子更新计划 |
+| `POST /api/adjustments/:id/reject` | 保管员 | 驳回（计划不变），body 可带 `reason` |
+| `POST /api/adjustments/:id/withdraw` | 布展员本人/保管员 | 撤回待审申请，之后可重新提交 |
+
+提交申请（`POST`）请求体：
+
+```json
+{
+  "planId": 12,
+  "startDate": "2030-12-31",
+  "endDate": "2031-01-02",
+  "periods": ["09:00-12:00", "13:00-17:00"],
+  "estimatedLux": 120,
+  "reason": "配合跨年活动改期（可选）"
+}
+```
+
+curl 调用示例（布展员提交 → 保管员核对 → 批准/驳回/撤回）：
+
+```bash
+# 1) 布展员提交调整申请（响应里的 preview 为即时试算；申请为 pending）
+curl -b cookies.txt -X POST http://localhost:3000/api/adjustments \
+  -H 'Content-Type: application/json' \
+  -d '{"planId":12,"startDate":"2030-12-31","endDate":"2031-01-02",
+       "periods":["09:00-12:00","13:00-17:00"],"estimatedLux":120}'
+
+# 2) 查看申请（原值 original + 拟改值 + preview.conflicts/yearlyReport）
+curl -b cookies.txt http://localhost:3000/api/adjustments/1
+
+# 3a) 保管员批准：成功返回更新后的展品详情
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/adjustments/1/approve
+
+# 3b) 保管员驳回（计划不变）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/adjustments/1/reject \
+  -H 'Content-Type: application/json' -d '{"reason":"与邻厅计划冲突"}'
+
+# 3c) 布展员撤回（之后可用同一 planId 重新提交）
+curl -b cookies.txt -X POST http://localhost:3000/api/adjustments/1/withdraw
+```
+
+批准核对失败时返回 **409**，申请保持 `pending`，`details.conflicts` 给出全部冲突：
+
+```json
+{
+  "error": "调整申请 #1 未通过核对：与同展品已批准计划「夜场」(#7) 开灯时间重叠；2031 年：上限 50000，其他占用 12000，原残余 800，拟改残余 40800，合计 52800，超额 2800 lx·h",
+  "details": {
+    "adjustmentId": 1,
+    "conflicts": {
+      "notApproved": false,
+      "notStarted": false,
+      "outsideMeasurements": [{ "id": 31, "status": "confirmed", "start": "2031-01-02 10:00", "end": "2031-01-02 11:00" }],
+      "overlappingPlans": [{ "id": 7, "title": "夜场", "status": "approved", "startDate": "2031-01-01", "endDate": "2031-01-03" }],
+      "missingLimits": [],
+      "overflows": [{
+        "year": 2031, "limit": 50000, "usedByOthers": 12000,
+        "oldResidue": 800, "newResidue": 40800, "projected": 52800, "excess": 2800
+      }]
+    },
+    "yearlyReport": { "2031": { "...": "每个相关年份的上限/其他占用/原残余/拟改残余/合计/超额" } }
+  }
+}
+```
+
+常见拒绝：越权（保管员提交、非申请人撤回）→ 403；计划非已批准/已开始/无效时段或照度 → 400；
+重复待审申请 → 409（`details.existingAdjustmentId`）。
+
+
 
 ```
 src/
@@ -115,8 +233,8 @@ src/
   audit.js         操作流水写入
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
-  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选
-  routes/          auth/users/exhibits/plans/measurements/audit 路由
+  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对
+  routes/          auth/users/exhibits/plans/adjustments/measurements/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
 Dockerfile / docker-compose.yml

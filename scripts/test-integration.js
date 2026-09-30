@@ -4,7 +4,8 @@
  * 基于 pg-mem 的端到端业务流程测试（不依赖真实 PostgreSQL）：
  *   node scripts/test-integration.js
  * 覆盖：登记额度、提交/批准、重叠拒绝、超限按年超额量、并发批准不超配、
- *       实测替代估算、重叠实测拒绝、迟到实测转待复核与复核重新校验。
+ *       实测替代估算、重叠实测拒绝、迟到实测转待复核与复核重新校验、
+ *       计划调整申请的提交/撤回/驳回/批准、待审占用、原值拟改值、冲突计划/实测/超额年份核对。
  */
 
 process.env.SEED_DEMO = 'false';
@@ -35,6 +36,12 @@ let assertCount = 0;
 function assert(cond, msg) {
   assertCount++;
   if (!cond) throw new Error('断言失败: ' + msg);
+}
+
+// pg-mem 的 DATE 可能返回 Date 对象，真实 pg 经类型解析返回 'YYYY-MM-DD'；统一取前 10 位
+function ymd(v) {
+  return typeof v === 'string' ? v.slice(0, 10)
+    : `${v.getUTCFullYear()}-${String(v.getUTCMonth() + 1).padStart(2, '0')}-${String(v.getUTCDate()).padStart(2, '0')}`;
 }
 
 function call(method, urlPath, body, role) {
@@ -358,10 +365,272 @@ async function runFlow() {
   assert(qr.some((x) => x.status === 409 && x.body.details && x.body.details.overflows),
     '被拒响应包含按年超额明细');
 
+  // =======================================================================
+  // 计划调整申请（布展员提交 / 撤回，保管员批准 / 驳回）
+  // 使用遥远的固定日期（2030/2031），保证“尚未开始”确定成立
+  // =======================================================================
+  // 第二个布展员，用于越权校验
+  r = await call('POST', '/api/users', {
+    username: 'installer2', password: 'setup123', role: 'installer', displayName: '布展员乙',
+  }, 'c');
+  assert(r.status === 201, '创建第二个布展员');
+  await call('POST', '/api/auth/login',
+    { username: 'installer2', password: 'setup123' }, 'i2');
+
+  const createExhibit = async (name) => {
+    const cr = await call('POST', '/api/exhibits', { name }, 'c');
+    assert(cr.status === 201, `登记展品 ${name}`);
+    return cr.body.exhibit.id;
+  };
+  const submitPlan = async (exId, title, startDate, endDate, periods, lux) => {
+    const cr = await call('POST', '/api/plans',
+      { exhibitId: exId, title, startDate, endDate, periods, estimatedLux: lux }, 'i');
+    assert(cr.status === 201, `提交计划 ${title}`);
+    return cr.body.plan.id;
+  };
+  const approvePlan = async (id) => {
+    const cr = await call('POST', `/api/plans/${id}/approve`, {}, 'c');
+    assert(cr.status === 200, `批准计划 #${id}（${cr.status} ${cr.body && cr.body.error}）`);
+  };
+
+  const ex2 = await createExhibit('调整流程展品');
+  await call('POST', `/api/exhibits/${ex2}/limits`, { year: 2030, limitLxh: 10000 }, 'c');
+  await call('POST', `/api/exhibits/${ex2}/limits`, { year: 2031, limitLxh: 10000 }, 'c');
+
+  // 计划 A：2030-06-01 单日 09-17，100lx = 800；计划 B：2030-06-02 夜场 18-22，100lx = 400
+  const planA = await submitPlan(ex2, '调整目标A', '2030-06-01', '2030-06-01', ['09:00-17:00'], 100);
+  const planB = await submitPlan(ex2, '相邻计划B', '2030-06-02', '2030-06-02', ['18:00-22:00'], 100);
+  await approvePlan(planA);
+  await approvePlan(planB);
+  // 一份尚未批准的计划（submitted），不能提交调整
+  const planSubmitted = await submitPlan(ex2, '未批准计划', '2030-07-01', '2030-07-01',
+    ['09:00-10:00'], 100);
+
+  // ---- 越权 / 状态 / 输入校验 ----
+  r = await call('POST', '/api/adjustments', { planId: planA,
+    startDate: '2030-06-01', endDate: '2030-06-01', periods: ['09:00-12:00'], estimatedLux: 100 }, 'c');
+  assert(r.status === 403, '保管员不能提交调整申请（越权）');
+
+  r = await call('POST', '/api/adjustments', { planId: planSubmitted,
+    startDate: '2030-07-01', endDate: '2030-07-01', periods: ['09:00-12:00'], estimatedLux: 100 }, 'i');
+  assert(r.status === 400 && /已批准/.test(r.body.error), '未批准计划的调整申请被拒绝');
+
+  // 已开始的已批准计划（plan1 在 2026-03，早已开始）
+  r = await call('POST', '/api/adjustments', { planId: plan1,
+    startDate: '2031-01-01', endDate: '2031-01-01', periods: ['09:00-12:00'], estimatedLux: 100 }, 'i');
+  assert(r.status === 400 && /已开始/.test(r.body.error), '已开始计划的调整申请被拒绝');
+
+  r = await call('POST', '/api/adjustments', { planId: planA,
+    startDate: '2030-06-01', endDate: '2030-06-01', periods: ['09:00-09:00'], estimatedLux: 100 }, 'i');
+  assert(r.status === 400, '零时长时段的调整申请被拒绝');
+
+  r = await call('POST', '/api/adjustments', { planId: planA,
+    startDate: '2030-06-10', endDate: '2030-06-01', periods: ['09:00-12:00'], estimatedLux: 100 }, 'i');
+  assert(r.status === 400, '展期倒置的调整申请被拒绝');
+
+  r = await call('POST', '/api/adjustments', { planId: planA,
+    startDate: '2030-06-01', endDate: '2030-06-01', periods: ['09:00-12:00'], estimatedLux: -5 }, 'i');
+  assert(r.status === 400, '非正照度的调整申请被拒绝');
+
+  // ---- 正常提交 + 重复申请拒绝 + 待审占用 ----
+  r = await call('POST', '/api/adjustments', {
+    planId: planA, startDate: '2030-12-31', endDate: '2031-01-01',
+    periods: ['09:00-17:00'], estimatedLux: 100, reason: '配合跨年活动改期',
+  }, 'i');
+  assert(r.status === 201, '提交调整申请 adj1');
+  const adj1 = r.body.adjustment.id;
+  assert(r.body.adjustment.preview.ok === true, '拟改窗口试算通过（无冲突）');
+  assert(r.body.adjustment.preview.newResidueYearly['2030'] === 800 &&
+    r.body.adjustment.preview.newResidueYearly['2031'] === 800,
+    '拟改残余按年各 800');
+
+  // 重复提交被拒
+  r = await call('POST', '/api/adjustments', {
+    planId: planA, startDate: '2031-02-01', endDate: '2031-02-01',
+    periods: ['09:00-12:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 409 && r.body.details.existingAdjustmentId === adj1,
+    '同一计划重复待审申请被拒绝（409，指明既有申请）');
+
+  // 待审期间原计划继续占用额度：展品 2030 已用仍为 A(800)+B(400)=1200
+  r = await call('GET', `/api/exhibits/${ex2}`, null, 'i');
+  assert(r.body.years['2030'].used === 1200, '待审期间原计划继续占用额度（2030=1200）');
+  // 计划行带有待审申请与原值/拟改值
+  const planARow = r.body.plans.find((p) => p.id === planA);
+  assert(planARow.pendingAdjustment && planARow.pendingAdjustment.id === adj1,
+    '展品详情计划行展示待审调整申请');
+
+  // 另一布展员不能撤回
+  r = await call('POST', `/api/adjustments/${adj1}/withdraw`, {}, 'i2');
+  assert(r.status === 403, '非申请人撤回被拒绝（403）');
+  // 保管员也不能批准尚未……（先测试驳回不改计划，随后撤回重提）
+  r = await call('POST', `/api/adjustments/${adj1}/reject`, { reason: '改期材料不全' }, 'c');
+  assert(r.status === 200, '保管员驳回 adj1');
+  r = await call('GET', `/api/plans/${planA}`, null, 'i');
+  assert(ymd(r.body.plan.start_date) === '2030-06-01' && !r.body.plan.pendingAdjustment,
+    '驳回不改变计划原值，且不再有待审申请');
+
+  // ---- 撤回后可重提 ----
+  // 先提交再撤回
+  r = await call('POST', '/api/adjustments', {
+    planId: planA, startDate: '2030-12-31', endDate: '2031-01-01',
+    periods: ['09:00-12:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201, '驳回后可重新提交 adj2');
+  const adj2 = r.body.adjustment.id;
+  r = await call('POST', `/api/adjustments/${adj2}/withdraw`, {}, 'i');
+  assert(r.status === 200, '申请人撤回 adj2');
+  r = await call('POST', `/api/adjustments/${adj2}/approve`, {}, 'c');
+  assert(r.status === 400, '已撤回申请不能再批准');
+  r = await call('POST', '/api/adjustments', {
+    planId: planA, startDate: '2030-12-31', endDate: '2031-01-01',
+    periods: ['09:00-17:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201, '撤回后可再次提交 adj3');
+  const adj3 = r.body.adjustment.id;
+
+  // ---- 批准冲突：与其他已批准计划开灯重叠（申请保持待审）----
+  // 把拟改窗口改成与计划 B（2030-06-02 18-22）重叠
+  await call('POST', `/api/adjustments/${adj3}/withdraw`, {}, 'i');
+  r = await call('POST', '/api/adjustments', {
+    planId: planA, startDate: '2030-06-02', endDate: '2030-06-02',
+    periods: ['20:00-21:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201, '提交与 B 重叠的 adj4（提交时不拦截，批准时核对）');
+  const adj4 = r.body.adjustment.id;
+  assert(r.body.adjustment.preview.ok === false, '试算标记不通过');
+  assert(r.body.adjustment.preview.conflicts.overlappingPlans.some((p) => p.id === planB),
+    '试算指出冲突计划 B');
+  r = await call('POST', `/api/adjustments/${adj4}/approve`, {}, 'c');
+  assert(r.status === 409, '重叠调整申请批准被拒（409）');
+  assert(/相邻计划B/.test(r.body.error), '错误信息指出冲突计划');
+  assert(r.body.details.conflicts.overlappingPlans[0].id === planB,
+    '结构化冲突明细包含冲突计划');
+  // 申请保持待审，可撤回
+  r = await call('GET', `/api/adjustments/${adj4}`, null, 'i');
+  assert(r.body.adjustment.status === 'pending', '核对失败后申请保持待审');
+  await call('POST', `/api/adjustments/${adj4}/withdraw`, {}, 'i');
+
+  // ---- 批准冲突：未作废实测落在新开灯窗外（draft 也算未作废）----
+  // 先批准合规调整，随后在新窗口内录入实测；再用一个排除该实测的新窗口申请
+  r = await call('POST', '/api/adjustments', {
+    planId: planA, startDate: '2030-12-31', endDate: '2031-01-01',
+    periods: ['09:00-17:00'], estimatedLux: 100,
+  }, 'i');
+  const adj5 = r.body.adjustment.id;
+  r = await call('POST', `/api/adjustments/${adj5}/approve`, {}, 'c');
+  assert(r.status === 200, '批准合规调整 adj5，原子更新计划');
+  r = await call('GET', `/api/plans/${planA}`, null, 'i');
+  assert(ymd(r.body.plan.start_date) === '2030-12-31' && ymd(r.body.plan.end_date) === '2031-01-01' &&
+    r.body.plan.estimated_lux === 100, '计划展期已更新为拟改值');
+  assert(!r.body.plan.pendingAdjustment, '通过后无待审申请');
+
+  // 在新窗口内录入一条实测（draft，未作废）
+  r = await call('POST', '/api/measurements', {
+    planId: planA, startDate: '2030-12-31', startTime: '09:00',
+    endDate: '2030-12-31', endTime: '12:00', actualLux: 120,
+  }, 'c');
+  assert(r.status === 201, '在更新后窗口内录入实测草稿');
+  const adjMeasId = r.body.measurement.id;
+  // 再次调整到不含该实测的窗口（2031-06-01 09-12）
+  r = await call('POST', '/api/adjustments', {
+    planId: planA, startDate: '2031-06-01', endDate: '2031-06-01',
+    periods: ['09:00-12:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201, '提交排除既有实测窗口的 adj6');
+  const adj6 = r.body.adjustment.id;
+  r = await call('POST', `/api/adjustments/${adj6}/approve`, {}, 'c');
+  assert(r.status === 409, '含窗外未作废实测的调整批准被拒');
+  assert(new RegExp(`实测 #${adjMeasId}`).test(r.body.error), '错误信息指出冲突实测');
+  assert(r.body.details.conflicts.outsideMeasurements[0].id === adjMeasId,
+    '结构化冲突明细包含冲突实测');
+  await call('POST', `/api/adjustments/${adj6}/withdraw`, {}, 'i');
+
+  // ---- 批准冲突：按年超额 ----
+  const ex3 = await createExhibit('调整超额展品');
+  await call('POST', `/api/exhibits/${ex3}/limits`, { year: 2030, limitLxh: 800 }, 'c');
+  const planC = await submitPlan(ex3, '小额计划C', '2030-08-01', '2030-08-01',
+    ['09:00-17:00'], 50); // 400
+  await approvePlan(planC);
+  // 申请把照度改为 200lx（仍 8h）=> 1600，超 2030 上限 800，超额 800
+  r = await call('POST', '/api/adjustments', {
+    planId: planC, startDate: '2030-08-01', endDate: '2030-08-01',
+    periods: ['09:00-17:00'], estimatedLux: 200,
+  }, 'i');
+  assert(r.status === 201, '提交超额调整 adj7');
+  const adj7 = r.body.adjustment.id;
+  assert(r.body.adjustment.preview.ok === false &&
+    r.body.adjustment.preview.conflicts.overflows[0].year === 2030,
+    '试算指出超额年份 2030');
+  r = await call('POST', `/api/adjustments/${adj7}/approve`, {}, 'c');
+  assert(r.status === 409, '超额调整批准被拒（409）');
+  const o = r.body.details.conflicts.overflows.find((x) => x.year === 2030);
+  assert(o && o.limit === 800 && o.newResidue === 1600 && o.projected === 1600 &&
+    o.excess === 800, `超额明细数值正确：${JSON.stringify(o)}`);
+  r = await call('GET', `/api/plans/${planC}`, null, 'i');
+  assert(r.body.plan.estimated_lux === 50, '核对失败不改变计划（照度仍 50）');
+  assert(r.body.plan.pendingAdjustment && r.body.plan.pendingAdjustment.id === adj7,
+    '超额申请保持待审');
+  // 提额后重新核对通过（同一份申请无需撤回重提）
+  await call('POST', `/api/exhibits/${ex3}/limits`, { year: 2030, limitLxh: 2000 }, 'c');
+  r = await call('POST', `/api/adjustments/${adj7}/approve`, {}, 'c');
+  assert(r.status === 200, '提额后同一待审申请批准通过');
+  r = await call('GET', `/api/plans/${planC}`, null, 'i');
+  assert(r.body.plan.estimated_lux === 200, '计划照度更新为拟改值 200');
+
+  // ---- 实测覆盖部分新窗口：以新窗口未被实测覆盖部分估算 ----
+  // 删除上面的 draft 实测（草稿可删），改用已确认实测落在 A 当前窗口（2030-12-31~2031-01-01）
+  await call('DELETE', `/api/measurements/${adjMeasId}`, null, 'c');
+  // 2030-12-31 09:00-17:00 整段实测 100lx（确认，覆盖 2030 那天 8h）
+  r = await call('POST', '/api/measurements', {
+    planId: planA, startDate: '2030-12-31', startTime: '09:00',
+    endDate: '2030-12-31', endTime: '17:00', actualLux: 100,
+  }, 'c');
+  assert(r.status === 201, '录入覆盖 2030 当天的实测草稿');
+  const measFull = r.body.measurement.id;
+  r = await call('POST', `/api/measurements/${measFull}/confirm`, {}, 'c');
+  assert(r.status === 200, '确认实测（2030 占用改为实测 800）');
+  // 拟改窗口不变（同窗口），批准一个“仅照度变化”的调整：新残余 2030=0（被覆盖），2031=800
+  r = await call('POST', '/api/adjustments', {
+    planId: planA, startDate: '2030-12-31', endDate: '2031-01-01',
+    periods: ['09:00-17:00'], estimatedLux: 300,
+  }, 'i');
+  assert(r.status === 201, '提交照度调整 adj8');
+  const adj8 = r.body.adjustment.id;
+  const pv = r.body.adjustment.preview;
+  assert((pv.newResidueYearly['2030'] || 0) === 0 && pv.newResidueYearly['2031'] === 2400,
+    `新窗口已确认实测覆盖部分不估算：2030=0,2031=2400，实际 ${JSON.stringify(pv.newResidueYearly)}`);
+  r = await call('POST', `/api/adjustments/${adj8}/approve`, {}, 'c');
+  assert(r.status === 200, '含已确认实测覆盖的调整批准通过');
+  // 2030 占用：实测 800 + B(400) = 1200（原 A 残余被实测替代，调整后仍为 0 残余）
+  r = await call('GET', `/api/exhibits/${ex2}`, null, 'c');
+  assert(r.body.years['2030'].used === 1200,
+    `调整后 2030 占用=实测800+B400=1200，实际 ${r.body.years['2030'].used}`);
+  assert(r.body.years['2031'].used === 2400, `2031 占用=新残余 2400，实际 ${r.body.years['2031'].used}`);
+
+  // ---- 调整申请列表接口 ----
+  r = await call('GET', '/api/adjustments?exhibitId=' + ex2 + '&status=approved', null, 'i');
+  assert(r.status === 200 && r.body.adjustments.some((a) => a.id === adj5),
+    '可按展品/状态查询已通过调整申请');
+  r = await call('GET', '/api/adjustments?planId=' + planC, null, 'i');
+  assert(r.body.adjustments.every((a) => a.planId === planC) &&
+    r.body.adjustments.some((a) => a.status === 'approved'),
+    '按计划查询调整历史');
+
   // ---- 操作流水存在 ----
   r = await call('GET', '/api/audit?limit=1000', null, 'c');
   assert(r.status === 200 && r.body.events.some((e) => e.action === 'plan.approve'),
     '操作流水记录了审批事件');
+  assert(r.body.events.some((e) => e.action === 'plan.adjustment.submit'),
+    '操作流水记录了调整申请提交');
+  assert(r.body.events.some((e) => e.action === 'plan.adjustment.approve'),
+    '操作流水记录了调整申请批准');
+  assert(r.body.events.some((e) => e.action === 'plan.update_via_adjustment'),
+    '操作流水记录了计划经调整更新');
+  assert(r.body.events.some((e) => e.action === 'plan.adjustment.withdraw'),
+    '操作流水记录了调整申请撤回');
+  assert(r.body.events.some((e) => e.action === 'plan.adjustment.reject'),
+    '操作流水记录了调整申请驳回');
 }
 
 main().catch((err) => {

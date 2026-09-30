@@ -114,3 +114,21 @@ tr.over-row td { background: #fdeceb; }
 .flash ul { margin: 6px 0 0 18px; padding: 0; }
 .plan-row-head { font-weight: 600; }
 .mono { font-variant-numeric: tabular-nums; }
+
+/* 计划调整申请 */
+.badge.pending { background: #e0ecff; color: #1d4f91; }
+.badge.withdrawn { background: #eceff3; color: #6b7280; }
+.adj-box {
+  margin-top: 8px; border: 1px solid #c9ddf0; background: #f7faff;
+  border-radius: 8px; padding: 8px 10px; font-size: 12.5px;
+}
+.adj-head { font-weight: 600; margin-bottom: 6px; }
+.adj-btns { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.adj-ok { color: #176b3a; background: #e8f7ef; border-radius: 6px; padding: 5px 8px; margin: 6px 0; }
+.adj-conflict { color: #8a2c22; background: #fdeceb; border-radius: 6px; padding: 6px 8px; margin: 6px 0; }
+.adj-conflict ul { margin: 4px 0 0 18px; padding: 0; }
+table.diff-table { width: 100%; border-collapse: collapse; margin-top: 4px; font-size: 12px; }
+table.diff-table th, table.diff-table td { border: 1px solid #dde5ee; padding: 4px 7px; text-align: left; }
+table.diff-table th { background: #eef3f8; width: 64px; font-weight: 600; }
+table.diff-table td.changed { background: #fff5e0; color: #9a6700; }
+.ok { color: #176b3a; }
